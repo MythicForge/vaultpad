@@ -1,0 +1,26 @@
+[package]
+name = "sticky-vault"
+version = "0.1.0"
+description = "Quick-capture notes stored as Markdown files in a folder"
+edition = "2021"
+
+[lib]
+name = "sticky_vault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+ulid = "1"
+walkdir = "2"
+trash = "5"
+
+[dev-dependencies]
+tempfile = "3"

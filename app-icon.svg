@@ -1,0 +1,8 @@
+<!-- App icon: Lucide "sticky-note" (ISC license, https://lucide.dev) on a rounded tile -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="#f0c040"/>
+  <g transform="translate(192 192) scale(26.667)" fill="none" stroke="#1f1d1a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path fill="#fff6d5" d="M21 9a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 15 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z"/>
+    <path d="M15 3v5a1 1 0 0 0 1 1h5"/>
+  </g>
+</svg>

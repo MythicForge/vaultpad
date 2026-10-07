@@ -1,0 +1,104 @@
+:root {
+  --ink: #1f1d1a;
+  --muted: #7a746b;
+  --paper: #fffdf6;
+  --side: #f6f2e6;
+  --hover: #ece6d4;
+  --line: #e2dbc8;
+  --accent: #e0a800;
+  --accent-soft: #fbe8a6;
+  --danger: #c0392b;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, 'Segoe UI', Ubuntu, Cantarell, sans-serif;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #ece8df;
+    --muted: #9a9387;
+    --paper: #1e1d1b;
+    --side: #252320;
+    --hover: #2f2c28;
+    --line: #36332e;
+    --accent: #f0c040;
+    --accent-soft: #4a3f1c;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+}
+
+button:hover {
+  background: var(--hover);
+}
+
+button.icon {
+  padding: 6px;
+}
+
+button svg {
+  flex-shrink: 0;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1f1d1a;
+  font-weight: 600;
+}
+
+button.danger:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: white;
+}
+
+input[type='search'] {
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  outline: none;
+}
+
+input[type='search']:focus {
+  border-color: var(--accent);
+}
+
+kbd {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
