@@ -1,6 +1,6 @@
 [package]
-name = "sticky-vault"
-version = "0.1.0"
+name = "vault-pad"
+version = "0.1.1"
 description = "Quick-capture notes stored as Markdown files in a folder"
 edition = "2021"
 

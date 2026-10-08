@@ -7,6 +7,7 @@
   --line: #e2dbc8;
   --accent: #e0a800;
   --accent-soft: #fbe8a6;
+  --selection: #f3dc8a;
   --danger: #c0392b;
   --mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, 'Segoe UI', Ubuntu, Cantarell, sans-serif;
@@ -23,6 +24,7 @@
     --line: #36332e;
     --accent: #f0c040;
     --accent-soft: #4a3f1c;
+    --selection: #5a4c20;
   }
 }
 

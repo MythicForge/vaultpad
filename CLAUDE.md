@@ -7,6 +7,8 @@ typically an Obsidian vault or a subfolder of one. The folder is the only source
 Stack: **Tauri 2** (Rust backend) + **Svelte 5** (runes, plain JS, no TypeScript) + **Vite** + **CodeMirror 6**.
 Icons: **Lucide** (`@lucide/svelte` in the UI; app icon built from Lucide `sticky-note`). Don't hand-draw icons.
 
+> Project has now been renamed to VaultPad - N.F
+
 ## Commands
 
 ```sh

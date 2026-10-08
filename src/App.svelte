@@ -234,7 +234,7 @@
 {#if !inTauri}
   <div class="welcome">
     <StickyNote size={48} strokeWidth={1.5} />
-    <h1>Sticky Vault</h1>
+    <h1>Vault Pad</h1>
     <p>This page only works inside the app window. Run <code>npm run tauri dev</code> and use the window it opens.</p>
   </div>
 {:else if !ready}
@@ -242,7 +242,7 @@
 {:else if !vault}
   <div class="welcome">
     <StickyNote size={48} strokeWidth={1.5} />
-    <h1>Sticky Vault</h1>
+    <h1>Vault Pad</h1>
     <p>Pick a folder. Every note becomes a <code>.md</code> file inside it, so an Obsidian vault works too.</p>
     <button class="primary" onclick={pickVault}><FolderOpen size={16} /> Choose folder…</button>
   </div>

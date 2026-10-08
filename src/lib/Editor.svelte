@@ -13,6 +13,14 @@
   let host;
   let view;
 
+  // drawSelection (in minimalSetup) hides the native caret and paints its own
+  // cursor/selection with light-only defaults; recolor them from app tokens.
+  const tokenTheme = EditorView.theme({
+    '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--ink)', borderLeftWidth: '2px' },
+    '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection':
+      { backgroundColor: 'var(--selection) !important' },
+  });
+
   function makeState(text) {
     return EditorState.create({
       doc: text,
@@ -20,6 +28,7 @@
         minimalSetup,
         markdown(),
         EditorView.lineWrapping,
+        tokenTheme,
         keymap.of([indentWithTab]),
         placeholder('Start typing… first line becomes the file name'),
         EditorView.updateListener.of((u) => {
@@ -62,9 +71,6 @@
     font-family: var(--mono);
     line-height: 1.6;
     padding: 16px 20px;
-  }
-  .editor :global(.cm-content) {
-    caret-color: var(--ink);
   }
   .editor :global(.cm-placeholder) {
     color: var(--muted);
