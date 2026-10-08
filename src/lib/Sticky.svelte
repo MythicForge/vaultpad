@@ -1,8 +1,10 @@
 <script>
   import { onMount } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { listen } from '@tauri-apps/api/event';
   import * as api from './api.js';
   import Editor from './Editor.svelte';
+  import NameInput from './NameInput.svelte';
   import { Palette, Pin, PinOff, Plus, X } from '@lucide/svelte';
 
   // One popped-out note in its own frameless window. Placement, color and
@@ -20,6 +22,7 @@
   let color = $state('yellow');
   let onTop = $state(false);
   let showColors = $state(false);
+  let renaming = $state(false);
   let loadSeq = $state(0);
   let error = $state('');
 
@@ -107,6 +110,37 @@
     api.updateNoteState(id, { color: c }).catch(report);
   }
 
+  // Hand-rolled instead of data-tauri-drag-region, whose double-click
+  // maximizes the window: here a double-click on the title renames instead.
+  function onHeaderDown(e) {
+    if (e.button !== 0 || e.target.closest('button, input')) return;
+    e.preventDefault();
+    if (e.detail === 1) win.startDragging().catch(report);
+    else if (e.detail === 2 && e.target.closest('.title') && note) renaming = true;
+  }
+
+  function onKey(e) {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'r') {
+      e.preventDefault();
+      if (note) renaming = true;
+    }
+  }
+
+  async function rename(name) {
+    renaming = false;
+    const n = note;
+    if (!n) return;
+    await flush();
+    // Through the save chain so no queued save still targets the old path.
+    chain = chain
+      .then(async () => {
+        const meta = await api.renameNote(n.path, name);
+        n.path = meta.path;
+      })
+      .catch(report);
+    await chain;
+  }
+
   // New note in a new sticky, cascaded from this one and in the same color.
   async function newSticky() {
     try {
@@ -133,6 +167,11 @@
   onMount(() => {
     const unlisten = [
       win.onFocusChanged(({ payload: focused }) => (focused ? syncFromDisk() : flush())),
+      // Quit keeps the sticky `open` so it comes back next launch.
+      listen('app-quitting', async () => {
+        await flush();
+        await api.quitReady();
+      }),
       win.onMoved(saveGeometrySoon),
       win.onResized(saveGeometrySoon),
       // Closing a sticky (its X, Alt+F4, or "dock" from the main window) puts
@@ -159,9 +198,16 @@
   });
 </script>
 
+<svelte:window onkeydown={onKey} />
+
 <div class="sticky {color}">
-  <header data-tauri-drag-region>
-    <span class="title" data-tauri-drag-region>{title}</span>
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <header onmousedown={onHeaderDown}>
+    {#if renaming && note}
+      <NameInput value={api.stemOf(note.path)} oncommit={rename} oncancel={() => (renaming = false)} />
+    {:else}
+      <span class="title" title="Double-click or Ctrl/Cmd+Shift+R to rename">{title}</span>
+    {/if}
     <button class="icon" title="New sticky note" onclick={newSticky}><Plus size={14} /></button>
     <button class="icon" title="Color" onclick={() => (showColors = !showColors)}><Palette size={14} /></button>
     <button class="icon" class:on={onTop} title={onTop ? 'Stop keeping on top' : 'Keep on top'} onclick={toggleOnTop}>

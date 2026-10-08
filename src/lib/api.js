@@ -14,6 +14,8 @@ export const saveNote = (path, body) => invoke('save_note', { path, body });
 export const finalizeNote = (path) => invoke('finalize_note', { path });
 export const deleteNote = (path) => invoke('delete_note', { path });
 export const findNote = (id) => invoke('find_note', { id });
+// Renames the file (same folder); resolves to the note's new NoteMeta.
+export const renameNote = (path, name) => invoke('rename_note', { path, name });
 
 // Per-note UI state from <vault>/.sticky/state.json, keyed by note id:
 // { pinned, open, onTop, color, x, y, width, height }
@@ -24,6 +26,10 @@ export const popOut = (path) => invoke('pop_out', { path });
 export const closeSticky = (id) => invoke('close_sticky', { id });
 export const restoreStickies = () => invoke('restore_stickies');
 
+// Quitting: the backend emits `app-quitting`; every window saves, then calls quitReady().
+export const quit = () => invoke('quit');
+export const quitReady = () => invoke('quit_ready');
+
 // Sticky windows are labelled `sticky-<hex of note id>` (see sticky_label in lib.rs).
 export function stickyIdFromLabel(label) {
   if (!label.startsWith('sticky-')) return null;
@@ -31,12 +37,19 @@ export function stickyIdFromLabel(label) {
   return new TextDecoder().decode(Uint8Array.from(bytes, (h) => parseInt(h, 16)));
 }
 
-// Mirrors notes::title_of on the Rust side so the list updates while typing.
+// Timestamp names given by notes::create, e.g. `2026-10-07 0915` or `2026-10-07 0915 2`.
+const AUTO_NAME = /^\d{4}-\d{2}-\d{2} \d{4}( \d+)?$/;
+
+export const stemOf = (path) => path.split('/').pop().replace(/\.md$/i, '');
+
+// Mirrors notes::title_of on the Rust side so the list updates while typing:
+// named notes show their name, timestamp-named ones their first line.
 export function titleOf(body, path) {
+  const stem = stemOf(path);
+  if (!AUTO_NAME.test(stem)) return stem;
   for (const line of body.split('\n')) {
     const t = line.trim().replace(/^#+\s*/, '').trim();
     if (t) return t;
   }
-  const file = path.split('/').pop();
-  return file.replace(/\.md$/i, '');
+  return stem;
 }

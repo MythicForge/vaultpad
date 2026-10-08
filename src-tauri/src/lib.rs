@@ -1,14 +1,17 @@
 mod notes;
 mod sticky;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use notes::NoteMeta;
 use serde::{Deserialize, Serialize};
 use sticky::NoteState;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 
@@ -23,6 +26,8 @@ struct AppState {
     vault: Mutex<Option<PathBuf>>,
     /// Serializes read-modify-write of `.sticky/state.json` across windows.
     ui_lock: Mutex<()>,
+    /// While quitting: labels of windows that haven't confirmed their final save.
+    quitting: Mutex<Option<HashSet<String>>>,
 }
 
 impl AppState {
@@ -83,6 +88,85 @@ fn open_sticky_window(app: &AppHandle, id: &str, st: &NoteState) -> Result<(), S
     // every time the saved size is restored.
     let size = tauri::LogicalSize::new(st.width.unwrap_or(300.0), st.height.unwrap_or(300.0));
     win.set_size(size).map_err(|e| e.to_string())
+}
+
+/// Upper bound on waiting for windows to save before the app exits anyway.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn show_main(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+/// Asks every window to save (each answers with `quit_ready`), then exits.
+fn request_quit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let labels: HashSet<String> = app.webview_windows().into_keys().collect();
+    {
+        let mut quitting = state.quitting.lock().unwrap();
+        if quitting.is_some() {
+            return;
+        }
+        *quitting = Some(labels);
+    }
+    let _ = app.emit("app-quitting", ());
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(QUIT_TIMEOUT);
+        app.exit(0);
+    });
+}
+
+fn pop_out_path(app: &AppHandle, state: &AppState, path: &str) -> Result<NoteMeta, String> {
+    let (note, id) = ensure_note_id(&state.vault()?, path)?;
+    let st = state.update_ui(app, &id, sticky::Patch { open: Some(true), ..Default::default() })?;
+    open_sticky_window(app, &id, &st)?;
+    Ok(note)
+}
+
+/// Tray "New sticky note": a fresh note straight into its own window.
+fn new_sticky(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let note = notes::create(&state.vault()?)?;
+    pop_out_path(app, &state, &note.path).map(|_| ())
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show Vault Pad", true, None::<&str>)?;
+    let new = MenuItem::with_id(app, "new-sticky", "New sticky note", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &new, &PredefinedMenuItem::separator(app)?, &quit])?;
+    TrayIconBuilder::with_id("main")
+        .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+        .tooltip("Vault Pad")
+        .menu(&menu)
+        // Left click shows the main window on Windows/macOS; Linux trays
+        // only ever open the menu.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main(app),
+            "quit" => request_quit(app),
+            "new-sticky" => {
+                // Off the event loop: window creation there can deadlock on Windows.
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if new_sticky(&app).is_err() {
+                        show_main(&app); // e.g. no vault chosen yet
+                    }
+                });
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
 }
 
 fn ensure_note_id(vault: &PathBuf, path: &str) -> Result<(NoteMeta, String), String> {
@@ -154,6 +238,19 @@ fn save_note(window: tauri::Window, state: State<'_, AppState>, path: String, bo
     Ok(note)
 }
 
+#[derive(Clone, Serialize)]
+struct NoteRenamed<'a> {
+    from: &'a str,
+    note: &'a NoteMeta,
+}
+
+#[tauri::command]
+fn rename_note(app: AppHandle, state: State<'_, AppState>, path: String, name: String) -> Result<NoteMeta, String> {
+    let note = notes::rename(&state.vault()?, &path, &name)?;
+    let _ = app.emit("note-renamed", NoteRenamed { from: &path, note: &note });
+    Ok(note)
+}
+
 #[tauri::command]
 fn find_note(state: State<'_, AppState>, id: String) -> Result<Option<NoteMeta>, String> {
     Ok(notes::list(&state.vault()?).into_iter().find(|n| n.id.as_deref() == Some(id.as_str())))
@@ -185,10 +282,24 @@ fn set_pinned(app: AppHandle, state: State<'_, AppState>, path: String, pinned: 
 /// Async because creating windows from a sync command deadlocks on Windows.
 #[tauri::command]
 async fn pop_out(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<NoteMeta, String> {
-    let (note, id) = ensure_note_id(&state.vault()?, &path)?;
-    let st = state.update_ui(&app, &id, sticky::Patch { open: Some(true), ..Default::default() })?;
-    open_sticky_window(&app, &id, &st)?;
-    Ok(note)
+    pop_out_path(&app, &state, &path)
+}
+
+#[tauri::command]
+fn quit(app: AppHandle) {
+    request_quit(&app);
+}
+
+/// A window finished its final save; exit once every window has.
+#[tauri::command]
+fn quit_ready(window: tauri::Window, app: AppHandle, state: State<'_, AppState>) {
+    let mut quitting = state.quitting.lock().unwrap();
+    if let Some(pending) = quitting.as_mut() {
+        pending.remove(window.label());
+        if pending.is_empty() {
+            app.exit(0);
+        }
+    }
 }
 
 /// Closes a sticky window; its own close handler saves and marks it closed.
@@ -236,6 +347,8 @@ fn delete_note(app: AppHandle, state: State<'_, AppState>, path: String) -> Resu
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be first: a second launch just surfaces the running app.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -245,11 +358,17 @@ pub fn run() {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
             let vault = config.vault.filter(|p| p.is_dir());
-            app.manage(AppState { config_path, vault: Mutex::new(vault), ui_lock: Mutex::new(()) });
+            app.manage(AppState {
+                config_path,
+                vault: Mutex::new(vault),
+                ui_lock: Mutex::new(()),
+                quitting: Mutex::new(None),
+            });
+            build_tray(app)?;
             Ok(())
         })
-        // Closing the main window quits, even with stickies open (no tray yet).
-        // Stickies save on blur, which happens as soon as the main window is clicked.
+        // The main window only hides on close (App.svelte); quitting goes
+        // through request_quit. This is a backstop if it's destroyed anyway.
         .on_window_event(|window, event| {
             if window.label() == "main" && matches!(event, WindowEvent::Destroyed) {
                 window.app_handle().exit(0);
@@ -266,12 +385,15 @@ pub fn run() {
             finalize_note,
             delete_note,
             find_note,
+            rename_note,
             get_note_states,
             update_note_state,
             set_pinned,
             pop_out,
             close_sticky,
             restore_stickies,
+            quit,
+            quit_ready,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

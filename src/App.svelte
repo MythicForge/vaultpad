@@ -6,8 +6,9 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import * as api from './lib/api.js';
   import Editor from './lib/Editor.svelte';
+  import NameInput from './lib/NameInput.svelte';
   import blankIcon from '../src-tauri/icons/vaultpad-blank.svg?url';
-  import { FolderOpen, Library, Pin, Plus, SquareArrowOutUpRight, StickyNote, Trash2 } from '@lucide/svelte';
+  import { FolderOpen, Library, Pencil, Pin, Plus, SquareArrowOutUpRight, StickyNote, Trash2 } from '@lucide/svelte';
 
   const SAVE_DELAY_MS = 500;
   // Vite serves this UI on localhost:1420 for the Tauri window; a plain browser has no backend.
@@ -22,6 +23,7 @@
   let error = $state('');
   let searchEl = $state();
   let states = $state({}); // note id -> { pinned, open, ... } from .sticky/state.json
+  let renaming = $state(false);
 
   // Saves are serialized through `chain` so they never overlap or reorder.
   let dirty = false;
@@ -183,6 +185,30 @@
     }
   }
 
+  // A rename from any window (see note-renamed listener) or from here.
+  function applyRename(from, meta) {
+    replaceNote(from, meta);
+    if (current?.path === from) {
+      current.path = meta.path;
+      current.title = meta.title;
+    }
+  }
+
+  async function renameCurrent(name) {
+    renaming = false;
+    const note = current;
+    if (!note) return;
+    await flush();
+    // Through the save chain so no queued save still targets the old path.
+    chain = chain
+      .then(async () => {
+        const from = note.path;
+        applyRename(from, await api.renameNote(from, name));
+      })
+      .catch(report);
+    await chain;
+  }
+
   async function togglePin(meta) {
     await flush();
     try {
@@ -238,7 +264,17 @@
     } else if (key === 's') {
       e.preventDefault();
       flush();
+    } else if (key === 'q') {
+      e.preventDefault();
+      api.quit();
+    } else if (key === 'r' && e.shiftKey) {
+      e.preventDefault();
+      if (current) renaming = true;
     }
+  }
+
+  function onKeyUp(e) {
+    if (e.key === 'F2' && current && !renaming) renaming = true;
   }
 
   function onSearchKey(e) {
@@ -265,9 +301,19 @@
     const win = getCurrentWindow();
     const unlisten = [
       win.onFocusChanged(({ payload: focused }) => (focused ? syncFromDisk() : flush())),
-      // The window closes once this handler resolves, so pending edits land first.
-      win.onCloseRequested(() => leave()),
+      // Closing hides to the tray (stickies stay up); Quit is in the tray menu / Ctrl+Q.
+      win.onCloseRequested(async (event) => {
+        event.preventDefault();
+        await leave();
+        if (current && !notes.some((n) => n.path === current.path)) current = null;
+        await win.hide();
+      }),
+      listen('app-quitting', async () => {
+        await leave();
+        await api.quitReady();
+      }),
       listen('note-states-changed', refreshStates),
+      listen('note-renamed', ({ payload }) => applyRename(payload.from, payload.note)),
       // Edits made in sticky windows: keep the list's title/preview/order current.
       listen('note-changed', ({ payload }) => {
         if (payload.source === 'main') return;
@@ -291,7 +337,7 @@
   });
 </script>
 
-<svelte:window onkeydown={onKey} />
+<svelte:window onkeydown={onKey} onkeyup={onKeyUp} />
 
 {#if !inTauri}
   <div class="welcome">
@@ -347,7 +393,16 @@
     <main>
       {#if current}
         <div class="toolbar">
-          <span class="path" title={current.path}>{current.path}</span>
+          {#if renaming}
+            <NameInput value={api.stemOf(current.path)} oncommit={renameCurrent} oncancel={() => (renaming = false)} />
+          {:else}
+            <button class="path" title="{current.path} (click, F2 or Ctrl/Cmd+Shift+R to rename)" onclick={() => (renaming = true)}>
+              {current.path}
+            </button>
+            <button class="icon" title="Rename (F2 or Ctrl/Cmd+Shift+R)" onclick={() => (renaming = true)}>
+              <Pencil size={16} />
+            </button>
+          {/if}
           <button
             class="icon"
             class:on={isPinned(current)}
@@ -495,14 +550,24 @@
     border-bottom: 1px solid var(--line);
   }
   .path {
+    display: block;
     flex: 1;
     min-width: 0;
+    padding: 3px 6px;
     font-size: 12px;
     color: var(--muted);
     font-family: var(--mono);
+    text-align: left;
+    background: transparent;
+    border-color: transparent;
+    cursor: text;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .path:hover {
+    background: transparent;
+    border-color: var(--line);
   }
   .placeholder,
   .welcome {

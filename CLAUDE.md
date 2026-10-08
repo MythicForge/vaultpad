@@ -59,8 +59,13 @@ body text
 
 - **Paths crossing the IPC boundary are vault-relative with `/` separators.** Always go through
   `notes::resolve()`, which rejects `..`, absolute paths and non-`.md` files.
-- **Files are never renamed.** New notes are `YYYY-MM-DD HHMM[ N].md` and keep that name (user
-  choice; first-line renaming was removed). The list *displays* the first line as the title.
+- **Files are only renamed when the user explicitly renames them** (`rename_note`; never automatically —
+  first-line renaming was removed by user choice). New notes are `YYYY-MM-DD HHMM[ N].md`.
+- **Title rule** (`title_of` in Rust, `titleOf` in api.js — keep in sync): user-named notes show their
+  file name; timestamp-named notes show their first non-blank line.
+- Renames go through `safe_name` (Windows-reserved names, illegal chars, `#^[]` for Obsidian links,
+  60 chars max), stay in the same folder, never overwrite (case-only change allowed), and run inside
+  the save `chain`. `rename_note` emits `note-renamed {from, note}`.
 - **Auto-delete only blank auto-named notes whose frontmatter holds nothing but `id`.**
 - **Writes are atomic** (`.<name>.tmp` + rename). Temp files are dotfiles so listing skips them.
 - **Listing skips dot-directories** (`.obsidian`, `.trash`, `.sticky`).
@@ -77,9 +82,14 @@ body text
   read `note.path` inside the chained callback, not before.
 - Leaving a note (switch, new, close, change vault) → `leave()` = flush + `finalize_note`.
 - Window blur → flush; focus → `syncFromDisk()` (reloads list; reloads editor if file changed and not dirty).
-- Window close → `onCloseRequested(leave)`; requires `core:window:allow-destroy` in capabilities.
+- Main window close → `leave()` then **hide** (to tray); never quits. Quit = tray menu or Ctrl/Cmd+Q →
+  `request_quit` emits `app-quitting`; every window saves and calls `quit_ready`; exit when all have
+  answered (2 s fallback). Any new window type must join this handshake.
 - Bump `loadSeq` whenever the editor content must be replaced from outside; never on normal typing.
-- Shortcuts: Ctrl/Cmd+N new, Ctrl/Cmd+K or F search, Ctrl/Cmd+S force save.
+- Shortcuts: Ctrl/Cmd+N new, Ctrl/Cmd+K or F search, Ctrl/Cmd+S force save, Ctrl/Cmd+Q quit, F2 or
+  Ctrl/Cmd+Shift+R rename (main and stickies).
+- Rename UI: `NameInput.svelte` (Enter/blur commit, Escape cancel) in the main toolbar (click path,
+  pencil, F2) and in the sticky title bar (double-click title).
 - `save_note` emits `note-changed {note, source: label}`; main applies saves from other windows to the list.
 - `refreshStates()` reloads the full list whenever a sticky opens or closes (new note from a sticky's +,
   blank note dropped on close).
@@ -90,15 +100,29 @@ body text
   `stickyIdFromLabel` in api.js decodes. Created in Rust (`open_sticky_window`) from async commands
   (sync command + window creation deadlocks on Windows).
 - Lifecycle: `pop_out` sets `open` and creates/focuses. Close (X, Alt+F4, `close_sticky` from main) →
-  sticky's onCloseRequested = flush + finalize + `open: false`. App quit and vault switch *destroy*
-  stickies without the handler, so `open` stays true and `restore_stickies` reopens them next time.
-  Stickies flush on blur, which is what keeps quit/vault-switch from losing edits.
-- Closing the main window exits the app (`on_window_event` Destroyed → `exit(0)`).
+  sticky's onCloseRequested = flush + finalize + `open: false`. Quit (handshake above) and vault
+  switch (`destroy`, relies on flush-on-blur) leave `open` true, so `restore_stickies` reopens them.
+- Sticky title-bar dragging is hand-rolled (`onHeaderDown` → `startDragging`), NOT
+  `data-tauri-drag-region`: Tauri's version maximizes on double-click, which blocked rename.
 - GTK/X11 frameless quirks (measured): `outerPosition` is off by a phantom ~37px title bar → save
   `innerPosition`; builder `inner_size` comes out ~37px too tall → size via `set_size` after build.
   Breaking either makes stickies creep a little on every restart.
+## Tray / app lifecycle
+
+- Tray (`build_tray` in lib.rs, icon `src-tauri/icons/tray.png` = `vaultpad-blank.svg` at 64px):
+  Show Vault Pad / New sticky note / Quit. Left click shows main on Windows/macOS; Linux only opens the menu.
+  Needs tauri features `tray-icon` + `image-png`. Tray actions creating windows run via `async_runtime::spawn`.
+- `tauri-plugin-single-instance` (registered first): a second launch calls `show_main` instead of
+  starting another process writing the same files.
+- Ubuntu GNOME shows the tray via its built-in AppIndicator extension; on GNOME without it, a hidden
+  main window can only be brought back by launching the app again (single-instance shows it).
+
+## Testing
+
 - Testing without touching the user's vault: `XDG_CONFIG_HOME=<scratch>/cfg npm run tauri dev` with
   `<scratch>/cfg/dev.vaultpad.app/config.json` pointing at a scratch vault; drive with `wmctrl`/`xdotool`.
+  Use `npm run tauri dev`, not the bare debug binary (it loads `devUrl`, blank without Vite).
+  Don't `pkill -f` a pattern that appears in your own command line; use `pkill -x vault-pad`.
 
 ## Adding things
 
@@ -115,7 +139,7 @@ body text
 
 1. ~~MVP: vault picker, list, editor, autosave, search, delete~~ (done)
 2. ~~Sticky windows (pop-out, color, always-on-top, + new sticky) and pin-to-top-of-list~~ (done)
-3. Tray icon (use `src-tauri/icons/vaultpad-blank.svg`), global hotkey for new note, autostart.
+3. ~~Tray icon~~ (done); still to do: global hotkey for new note, autostart.
 4. File watcher (`notify` crate) with self-write suppression + conflict copies.
 5. CI builds (tauri-action) for all three OSes.
 

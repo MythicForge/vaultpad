@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+const MAX_NAME_CHARS: usize = 60;
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H%M";
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,7 +72,12 @@ fn with_id(fm: Option<String>) -> String {
     }
 }
 
+/// A note the user named is titled by its file name; a timestamp-named one
+/// by its first non-blank line (falling back to the timestamp).
 pub fn title_of(body: &str, path: &Path) -> String {
+    if !is_auto_name(&stem(path)) {
+        return stem(path);
+    }
     body.lines()
         .map(|l| l.trim().trim_start_matches('#').trim())
         .find(|l| !l.is_empty())
@@ -81,6 +87,29 @@ pub fn title_of(body: &str, path: &Path) -> String {
 
 fn stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Turns a user-entered name into a file name that is valid on Windows, macOS
+/// and Linux and safe in Obsidian links (`#^[]` stripped).
+fn safe_name(title: &str) -> Option<String> {
+    let cleaned: String = title
+        .chars()
+        .map(|c| if c.is_control() || r#"<>:"/\|?*#^[]"#.contains(c) { ' ' } else { c })
+        .collect();
+    let mut name = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some((idx, _)) = name.char_indices().nth(MAX_NAME_CHARS) {
+        name.truncate(idx);
+    }
+    let name = name.trim_end_matches(['.', ' ']).trim_start_matches('.').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((base.starts_with("COM") || base.starts_with("LPT"))
+            && base.len() == 4
+            && base.as_bytes()[3].is_ascii_digit());
+    Some(if reserved { format!("{name}_") } else { name })
 }
 
 /// Names produced by `create`, e.g. `2026-10-07 0915` or `2026-10-07 0915 2`.
@@ -221,6 +250,28 @@ pub fn finalize(vault: &Path, rel: &str) -> Result<Option<NoteMeta>, String> {
     Ok(Some(meta(vault, &abs, parsed)))
 }
 
+/// Renames a note within its folder. A trailing `.md` in `name` is ignored.
+/// Refuses to overwrite another note; a case-only change is allowed.
+pub fn rename(vault: &Path, rel: &str, name: &str) -> Result<NoteMeta, String> {
+    let abs = resolve(vault, rel)?;
+    let trimmed = name.trim();
+    let trimmed = match trimmed.len().checked_sub(3) {
+        Some(i) if trimmed.is_char_boundary(i) && trimmed[i..].eq_ignore_ascii_case(".md") => &trimmed[..i],
+        _ => trimmed,
+    };
+    let wanted = safe_name(trimmed).ok_or("Name can't be empty")?;
+    let target = abs.parent().unwrap_or(vault).join(format!("{wanted}.md"));
+    if target == abs {
+        return load(vault, &abs);
+    }
+    let same_file = stem(&abs).eq_ignore_ascii_case(&wanted);
+    if target.exists() && !same_file {
+        return Err(format!("A note named \"{wanted}\" already exists"));
+    }
+    fs::rename(&abs, &target).map_err(|e| format!("rename {}: {e}", abs.display()))?;
+    load(vault, &target)
+}
+
 pub fn delete(vault: &Path, rel: &str) -> Result<(), String> {
     let abs = resolve(vault, rel)?;
     trash::delete(&abs).map_err(|e| format!("move {} to trash: {e}", abs.display()))
@@ -239,6 +290,44 @@ mod tests {
 
         let p = split("No frontmatter\n---\n");
         assert!(p.frontmatter.is_none());
+    }
+
+    #[test]
+    fn safe_names() {
+        assert_eq!(safe_name("# Call dentist: Tue?").as_deref(), Some("Call dentist Tue"));
+        assert_eq!(safe_name("con").as_deref(), Some("con_"));
+        assert_eq!(safe_name("...").as_deref(), None);
+        assert_eq!(safe_name(&"x".repeat(100)).unwrap().len(), MAX_NAME_CHARS);
+    }
+
+    #[test]
+    fn titles_follow_names() {
+        assert_eq!(title_of("# Milk\n", Path::new("2026-10-07 0915.md")), "Milk");
+        assert_eq!(title_of("\n", Path::new("2026-10-07 0915.md")), "2026-10-07 0915");
+        assert_eq!(title_of("# Milk\n", Path::new("sub/Shopping.md")), "Shopping");
+    }
+
+    #[test]
+    fn renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = dir.path();
+        let note = create(v).unwrap();
+        save(v, &note.path, "body\n").unwrap();
+
+        let named = rename(v, &note.path, "  Plans: Q4?.md ").unwrap();
+        assert_eq!(named.path, "Plans Q4.md");
+        assert_eq!(named.title, "Plans Q4");
+        assert_eq!(named.id, note.id);
+        assert!(!v.join(&note.path).exists());
+
+        fs::write(v.join("Taken.md"), "x").unwrap();
+        assert!(rename(v, &named.path, "Taken").is_err());
+        assert!(rename(v, &named.path, "   ").is_err());
+        assert_eq!(rename(v, &named.path, "plans q4").unwrap().path, "plans q4.md");
+
+        fs::create_dir(v.join("sub")).unwrap();
+        fs::write(v.join("sub/a.md"), "x").unwrap();
+        assert_eq!(rename(v, "sub/a.md", "b").unwrap().path, "sub/b.md");
     }
 
     #[test]
