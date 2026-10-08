@@ -1,12 +1,15 @@
 mod notes;
+mod sticky;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use notes::NoteMeta;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use sticky::NoteState;
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 
 /// Persisted in the OS config dir (e.g. ~/.config/dev.stickyvault.app/config.json).
@@ -18,12 +21,74 @@ struct Config {
 struct AppState {
     config_path: PathBuf,
     vault: Mutex<Option<PathBuf>>,
+    /// Serializes read-modify-write of `.sticky/state.json` across windows.
+    ui_lock: Mutex<()>,
 }
 
 impl AppState {
     fn vault(&self) -> Result<PathBuf, String> {
         self.vault.lock().unwrap().clone().ok_or_else(|| "No notes folder selected".into())
     }
+
+    /// Updates one note's UI state and tells every window about it.
+    fn update_ui(&self, app: &AppHandle, id: &str, patch: sticky::Patch) -> Result<NoteState, String> {
+        let vault = self.vault()?;
+        let result = {
+            let _guard = self.ui_lock.lock().unwrap();
+            sticky::update(&vault, id, patch)?
+        };
+        let _ = app.emit("note-states-changed", ());
+        Ok(result)
+    }
+
+    /// Drops the UI state of a note that no longer exists.
+    fn forget(&self, app: &AppHandle, vault: &PathBuf, id: Option<String>) -> Result<(), String> {
+        let Some(id) = id else { return Ok(()) };
+        {
+            let _guard = self.ui_lock.lock().unwrap();
+            sticky::remove(vault, &id)?;
+        }
+        let _ = app.emit("note-states-changed", ());
+        Ok(())
+    }
+}
+
+const STICKY_PREFIX: &str = "sticky-";
+
+/// Window label for a note's sticky window. Ids come from frontmatter and may
+/// contain characters labels don't allow, so they're hex-encoded
+/// (decoded again by stickyIdFromLabel in api.js).
+fn sticky_label(id: &str) -> String {
+    let hex: String = id.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("{STICKY_PREFIX}{hex}")
+}
+
+fn open_sticky_window(app: &AppHandle, id: &str, st: &NoteState) -> Result<(), String> {
+    let label = sticky_label(id);
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.unminimize();
+        return win.set_focus().map_err(|e| e.to_string());
+    }
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::default())
+        .title("Vault Pad note")
+        .decorations(false)
+        .min_inner_size(180.0, 120.0)
+        .always_on_top(st.on_top);
+    if let (Some(x), Some(y)) = (st.x, st.y) {
+        builder = builder.position(x, y);
+    }
+    let win = builder.build().map_err(|e| e.to_string())?;
+    // Sized after creation: on GTK the builder's inner_size on a frameless
+    // window comes out taller by a phantom title bar, which then compounds
+    // every time the saved size is restored.
+    let size = tauri::LogicalSize::new(st.width.unwrap_or(300.0), st.height.unwrap_or(300.0));
+    win.set_size(size).map_err(|e| e.to_string())
+}
+
+fn ensure_note_id(vault: &PathBuf, path: &str) -> Result<(NoteMeta, String), String> {
+    let note = notes::ensure_id(vault, path)?;
+    let id = note.id.clone().ok_or("note has no id")?;
+    Ok((note, id))
 }
 
 #[tauri::command]
@@ -32,10 +97,18 @@ fn get_vault(state: State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-fn set_vault(state: State<'_, AppState>, path: String) -> Result<String, String> {
+fn set_vault(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<String, String> {
     let path = PathBuf::from(path);
     if !path.is_dir() {
         return Err(format!("not a folder: {}", path.display()));
+    }
+    // Stickies belong to the old vault. They already saved on blur, and
+    // destroy (unlike close) skips their close handler, so nothing they do
+    // can land in the new vault. Their state stays `open` for next time.
+    for (label, win) in app.webview_windows() {
+        if label.starts_with(STICKY_PREFIX) {
+            let _ = win.destroy();
+        }
     }
     let config = Config { vault: Some(path.clone()) };
     if let Some(dir) = state.config_path.parent() {
@@ -68,19 +141,96 @@ fn create_note(state: State<'_, AppState>) -> Result<NoteMeta, String> {
     notes::create(&state.vault()?)
 }
 
-#[tauri::command]
-fn save_note(state: State<'_, AppState>, path: String, body: String) -> Result<NoteMeta, String> {
-    notes::save(&state.vault()?, &path, &body)
+#[derive(Clone, Serialize)]
+struct NoteChanged<'a> {
+    note: &'a NoteMeta,
+    source: &'a str,
 }
 
 #[tauri::command]
-fn finalize_note(state: State<'_, AppState>, path: String) -> Result<Option<NoteMeta>, String> {
-    notes::finalize(&state.vault()?, &path)
+fn save_note(window: tauri::Window, state: State<'_, AppState>, path: String, body: String) -> Result<NoteMeta, String> {
+    let note = notes::save(&state.vault()?, &path, &body)?;
+    let _ = window.emit("note-changed", NoteChanged { note: &note, source: window.label() });
+    Ok(note)
 }
 
 #[tauri::command]
-fn delete_note(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    notes::delete(&state.vault()?, &path)
+fn find_note(state: State<'_, AppState>, id: String) -> Result<Option<NoteMeta>, String> {
+    Ok(notes::list(&state.vault()?).into_iter().find(|n| n.id.as_deref() == Some(id.as_str())))
+}
+
+#[tauri::command]
+fn get_note_states(state: State<'_, AppState>) -> Result<BTreeMap<String, NoteState>, String> {
+    Ok(sticky::load(&state.vault()?))
+}
+
+#[tauri::command]
+fn update_note_state(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    patch: sticky::Patch,
+) -> Result<NoteState, String> {
+    state.update_ui(&app, &id, patch)
+}
+
+#[tauri::command]
+fn set_pinned(app: AppHandle, state: State<'_, AppState>, path: String, pinned: bool) -> Result<NoteMeta, String> {
+    let (note, id) = ensure_note_id(&state.vault()?, &path)?;
+    state.update_ui(&app, &id, sticky::Patch { pinned: Some(pinned), ..Default::default() })?;
+    Ok(note)
+}
+
+/// Opens a note as a sticky window, or focuses it if already open.
+/// Async because creating windows from a sync command deadlocks on Windows.
+#[tauri::command]
+async fn pop_out(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<NoteMeta, String> {
+    let (note, id) = ensure_note_id(&state.vault()?, &path)?;
+    let st = state.update_ui(&app, &id, sticky::Patch { open: Some(true), ..Default::default() })?;
+    open_sticky_window(&app, &id, &st)?;
+    Ok(note)
+}
+
+/// Closes a sticky window; its own close handler saves and marks it closed.
+#[tauri::command]
+fn close_sticky(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    match app.get_webview_window(&sticky_label(&id)) {
+        Some(win) => win.close().map_err(|e| e.to_string()),
+        None => state.update_ui(&app, &id, sticky::Patch { open: Some(false), ..Default::default() }).map(|_| ()),
+    }
+}
+
+/// Reopens the sticky windows that were open last time. Notes that no longer
+/// exist are skipped (their state is kept in case the file comes back).
+#[tauri::command]
+async fn restore_stickies(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let vault = state.vault()?;
+    let existing: std::collections::HashSet<String> = notes::list(&vault).into_iter().filter_map(|n| n.id).collect();
+    for (id, st) in sticky::load(&vault) {
+        if st.open && existing.contains(&id) && app.get_webview_window(&sticky_label(&id)).is_none() {
+            open_sticky_window(&app, &id, &st)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn finalize_note(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<Option<NoteMeta>, String> {
+    let vault = state.vault()?;
+    let id = notes::read(&vault, &path).ok().and_then(|n| n.id);
+    let result = notes::finalize(&vault, &path)?;
+    if result.is_none() {
+        state.forget(&app, &vault, id)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn delete_note(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let vault = state.vault()?;
+    let id = notes::read(&vault, &path).ok().and_then(|n| n.id);
+    notes::delete(&vault, &path)?;
+    state.forget(&app, &vault, id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -95,8 +245,15 @@ pub fn run() {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
             let vault = config.vault.filter(|p| p.is_dir());
-            app.manage(AppState { config_path, vault: Mutex::new(vault) });
+            app.manage(AppState { config_path, vault: Mutex::new(vault), ui_lock: Mutex::new(()) });
             Ok(())
+        })
+        // Closing the main window quits, even with stickies open (no tray yet).
+        // Stickies save on blur, which happens as soon as the main window is clicked.
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, WindowEvent::Destroyed) {
+                window.app_handle().exit(0);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_vault,
@@ -108,6 +265,13 @@ pub fn run() {
             save_note,
             finalize_note,
             delete_note,
+            find_note,
+            get_note_states,
+            update_note_state,
+            set_pinned,
+            pop_out,
+            close_sticky,
+            restore_stickies,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

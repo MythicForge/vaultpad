@@ -13,6 +13,23 @@ export const createNote = () => invoke('create_note');
 export const saveNote = (path, body) => invoke('save_note', { path, body });
 export const finalizeNote = (path) => invoke('finalize_note', { path });
 export const deleteNote = (path) => invoke('delete_note', { path });
+export const findNote = (id) => invoke('find_note', { id });
+
+// Per-note UI state from <vault>/.sticky/state.json, keyed by note id:
+// { pinned, open, onTop, color, x, y, width, height }
+export const getNoteStates = () => invoke('get_note_states');
+export const updateNoteState = (id, patch) => invoke('update_note_state', { id, patch });
+export const setPinned = (path, pinned) => invoke('set_pinned', { path, pinned });
+export const popOut = (path) => invoke('pop_out', { path });
+export const closeSticky = (id) => invoke('close_sticky', { id });
+export const restoreStickies = () => invoke('restore_stickies');
+
+// Sticky windows are labelled `sticky-<hex of note id>` (see sticky_label in lib.rs).
+export function stickyIdFromLabel(label) {
+  if (!label.startsWith('sticky-')) return null;
+  const bytes = label.slice(7).match(/../g) ?? [];
+  return new TextDecoder().decode(Uint8Array.from(bytes, (h) => parseInt(h, 16)));
+}
 
 // Mirrors notes::title_of on the Rust side so the list updates while typing.
 export function titleOf(body, path) {

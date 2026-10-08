@@ -30,7 +30,7 @@
         EditorView.lineWrapping,
         tokenTheme,
         keymap.of([indentWithTab]),
-        placeholder('Start typing… first line becomes the file name'),
+        placeholder('Start typing…'),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) onchange(u.state.doc.toString());
         }),

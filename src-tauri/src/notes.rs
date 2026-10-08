@@ -12,7 +12,6 @@ use std::time::UNIX_EPOCH;
 use serde::Serialize;
 use walkdir::WalkDir;
 
-const MAX_NAME_CHARS: usize = 60;
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H%M";
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,28 +83,6 @@ fn stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Turns a note title into a file name that is valid on Windows, macOS and Linux.
-fn safe_name(title: &str) -> Option<String> {
-    let cleaned: String = title
-        .chars()
-        .map(|c| if c.is_control() || r#"<>:"/\|?*#^[]"#.contains(c) { ' ' } else { c })
-        .collect();
-    let mut name = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    if let Some((idx, _)) = name.char_indices().nth(MAX_NAME_CHARS) {
-        name.truncate(idx);
-    }
-    let name = name.trim_end_matches(['.', ' ']).trim_start_matches('.').to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((base.starts_with("COM") || base.starts_with("LPT"))
-            && base.len() == 4
-            && base.as_bytes()[3].is_ascii_digit());
-    Some(if reserved { format!("{name}_") } else { name })
-}
-
 /// Names produced by `create`, e.g. `2026-10-07 0915` or `2026-10-07 0915 2`.
 fn is_auto_name(stem: &str) -> bool {
     let (stamp, suffix) = match stem.get(15..) {
@@ -129,7 +106,7 @@ fn unique_path(dir: &Path, stem: &str) -> PathBuf {
 }
 
 /// Write via a temp file + rename so Obsidian and sync tools never see a half-written note.
-fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     let name = path.file_name().ok_or("invalid note path")?.to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.tmp"));
     fs::write(&tmp, contents).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -202,6 +179,15 @@ pub fn read(vault: &Path, rel: &str) -> Result<NoteMeta, String> {
     load(vault, &resolve(vault, rel)?)
 }
 
+/// Adds an `id` to a note's frontmatter if it lacks one; the body is untouched.
+pub fn ensure_id(vault: &Path, rel: &str) -> Result<NoteMeta, String> {
+    let note = read(vault, rel)?;
+    if note.id.is_some() {
+        return Ok(note);
+    }
+    save(vault, rel, &note.body)
+}
+
 pub fn create(vault: &Path) -> Result<NoteMeta, String> {
     let stamp = chrono::Local::now().format(TIMESTAMP_FORMAT).to_string();
     let abs = unique_path(vault, &stamp);
@@ -221,27 +207,18 @@ pub fn save(vault: &Path, rel: &str, body: &str) -> Result<NoteMeta, String> {
 }
 
 /// Runs when the user leaves a note. A brand-new note (still carrying its
-/// timestamp name) is renamed after its first line, or removed if left blank.
-/// Notes with real names are never renamed or removed here.
+/// timestamp name) that was left blank is removed. File names never change.
 pub fn finalize(vault: &Path, rel: &str) -> Result<Option<NoteMeta>, String> {
     let abs = resolve(vault, rel)?;
-    if !abs.exists() || !is_auto_name(&stem(&abs)) {
-        return if abs.exists() { load(vault, &abs).map(Some) } else { Ok(None) };
+    if !abs.exists() {
+        return Ok(None);
     }
     let parsed = split(&fs::read_to_string(&abs).map_err(|e| format!("read {}: {e}", abs.display()))?);
-
-    if parsed.body.trim().is_empty() && only_has_id(parsed.frontmatter.as_deref()) {
+    if is_auto_name(&stem(&abs)) && parsed.body.trim().is_empty() && only_has_id(parsed.frontmatter.as_deref()) {
         fs::remove_file(&abs).map_err(|e| format!("remove {}: {e}", abs.display()))?;
         return Ok(None);
     }
-
-    let wanted = parsed.body.lines().find(|l| !l.trim().is_empty()).and_then(safe_name);
-    let Some(wanted) = wanted else {
-        return Ok(Some(meta(vault, &abs, parsed)));
-    };
-    let target = unique_path(abs.parent().unwrap_or(vault), &wanted);
-    fs::rename(&abs, &target).map_err(|e| format!("rename {}: {e}", abs.display()))?;
-    Ok(Some(meta(vault, &target, parsed)))
+    Ok(Some(meta(vault, &abs, parsed)))
 }
 
 pub fn delete(vault: &Path, rel: &str) -> Result<(), String> {
@@ -262,14 +239,6 @@ mod tests {
 
         let p = split("No frontmatter\n---\n");
         assert!(p.frontmatter.is_none());
-    }
-
-    #[test]
-    fn safe_names() {
-        assert_eq!(safe_name("# Call dentist: Tue?").as_deref(), Some("Call dentist Tue"));
-        assert_eq!(safe_name("con").as_deref(), Some("con_"));
-        assert_eq!(safe_name("...").as_deref(), None);
-        assert_eq!(safe_name(&"x".repeat(100)).unwrap().len(), MAX_NAME_CHARS);
     }
 
     #[test]
@@ -300,19 +269,27 @@ mod tests {
         assert_eq!(saved.id, note.id);
         assert_eq!(saved.title, "Buy milk");
 
+        // Notes keep their timestamp name; the title comes from the first line.
         let done = finalize(vault, &note.path).unwrap().unwrap();
-        assert_eq!(done.path, "Buy milk.md");
+        assert_eq!(done.path, note.path);
+        assert_eq!(done.title, "Buy milk");
         assert_eq!(done.id, note.id);
-
-        // Named notes are left alone even when their first line changes.
-        save(vault, &done.path, "Something else\n").unwrap();
-        assert_eq!(finalize(vault, &done.path).unwrap().unwrap().path, "Buy milk.md");
 
         let blank = create(vault).unwrap();
         assert!(finalize(vault, &blank.path).unwrap().is_none());
         assert!(!vault.join(&blank.path).exists());
 
         assert_eq!(list(vault).len(), 1);
+    }
+
+    #[test]
+    fn ensure_id_keeps_body() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Plain.md"), "hello\n").unwrap();
+        let note = ensure_id(dir.path(), "Plain.md").unwrap();
+        assert!(note.id.is_some());
+        assert_eq!(note.body, "hello\n");
+        assert_eq!(ensure_id(dir.path(), "Plain.md").unwrap().id, note.id);
     }
 
     #[test]

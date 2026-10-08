@@ -2,10 +2,12 @@
   import { onMount } from 'svelte';
   import { isTauri } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { listen } from '@tauri-apps/api/event';
   import { open } from '@tauri-apps/plugin-dialog';
   import * as api from './lib/api.js';
   import Editor from './lib/Editor.svelte';
-  import { FolderOpen, Library, Plus, StickyNote, Trash2 } from '@lucide/svelte';
+  import blankIcon from '../src-tauri/icons/vaultpad-blank.svg?url';
+  import { FolderOpen, Library, Pin, Plus, SquareArrowOutUpRight, StickyNote, Trash2 } from '@lucide/svelte';
 
   const SAVE_DELAY_MS = 500;
   // Vite serves this UI on localhost:1420 for the Tauri window; a plain browser has no backend.
@@ -19,18 +21,26 @@
   let loadSeq = $state(0); // bump to make the editor replace its document
   let error = $state('');
   let searchEl = $state();
+  let states = $state({}); // note id -> { pinned, open, ... } from .sticky/state.json
 
   // Saves are serialized through `chain` so they never overlap or reorder.
   let dirty = false;
   let timer;
   let chain = Promise.resolve();
 
+  const isPinned = (n) => !!(n?.id && states[n.id]?.pinned);
+  const isOut = (n) => !!(n?.id && states[n.id]?.open);
+
+  // Pinned notes first, each group newest first.
   const filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return notes;
-    return notes.filter(
-      (n) => n.title.toLowerCase().includes(q) || n.body.toLowerCase().includes(q) || n.path.toLowerCase().includes(q),
-    );
+    const matches = q
+      ? notes.filter(
+          (n) =>
+            n.title.toLowerCase().includes(q) || n.body.toLowerCase().includes(q) || n.path.toLowerCase().includes(q),
+        )
+      : notes;
+    return [...matches.filter(isPinned), ...matches.filter((n) => !isPinned(n))];
   });
 
   const vaultName = $derived(vault ? vault.split(/[\\/]/).filter(Boolean).pop() : '');
@@ -56,6 +66,21 @@
     if (!vault) return;
     try {
       notes = await api.listNotes();
+    } catch (e) {
+      report(e);
+    }
+  }
+
+  async function refreshStates() {
+    if (!vault) return;
+    try {
+      const fresh = await api.getNoteStates();
+      // A sticky opened or closed: it may be a note created in a sticky, or one
+      // dropped on close for being blank.
+      const ids = new Set([...Object.keys(states), ...Object.keys(fresh)]);
+      const toggled = [...ids].some((id) => !!states[id]?.open !== !!fresh[id]?.open);
+      states = fresh;
+      if (toggled) await refresh();
     } catch (e) {
       report(e);
     }
@@ -93,7 +118,7 @@
   }
 
   // Called when navigating away from a note: final save, then let the backend
-  // name it from its first line or drop it if it was left empty.
+  // drop it if it was a new note left empty.
   async function leave() {
     if (!current) return;
     const note = current;
@@ -120,6 +145,7 @@
 
   async function openNote(meta) {
     if (!meta || current?.path === meta.path) return;
+    if (isOut(meta)) return popOut(meta); // already a sticky: bring it forward
     await leave();
     try {
       current = await api.readNote(meta.path);
@@ -138,6 +164,32 @@
       current = { ...meta };
       query = '';
       loadSeq++;
+    } catch (e) {
+      report(e);
+    }
+  }
+
+  // Moves a note into its own sticky window. The main editor lets go of it
+  // so the two never edit the same file at once.
+  async function popOut(meta) {
+    try {
+      if (current?.path === meta.path) {
+        await flush();
+        current = null;
+      }
+      replaceNote(meta.path, await api.popOut(meta.path));
+    } catch (e) {
+      report(e);
+    }
+  }
+
+  async function togglePin(meta) {
+    await flush();
+    try {
+      const fresh = await api.setPinned(meta.path, !isPinned(meta));
+      replaceNote(meta.path, fresh);
+      if (current?.path === meta.path) current.id = fresh.id;
+      await refreshStates();
     } catch (e) {
       report(e);
     }
@@ -166,6 +218,8 @@
     try {
       vault = await api.setVault(dir);
       await refresh();
+      await refreshStates();
+      await api.restoreStickies();
     } catch (e) {
       report(e);
     }
@@ -213,12 +267,20 @@
       win.onFocusChanged(({ payload: focused }) => (focused ? syncFromDisk() : flush())),
       // The window closes once this handler resolves, so pending edits land first.
       win.onCloseRequested(() => leave()),
+      listen('note-states-changed', refreshStates),
+      // Edits made in sticky windows: keep the list's title/preview/order current.
+      listen('note-changed', ({ payload }) => {
+        if (payload.source === 'main') return;
+        moveToTop(payload.note.path, payload.note);
+      }),
     ];
 
     (async () => {
       try {
         vault = await api.getVault();
         await refresh();
+        await refreshStates();
+        if (vault) await api.restoreStickies();
       } catch (e) {
         report(e);
       }
@@ -233,7 +295,7 @@
 
 {#if !inTauri}
   <div class="welcome">
-    <StickyNote size={48} strokeWidth={1.5} />
+    <img class="mark" src={blankIcon} alt="" width="96" height="96" />
     <h1>Vault Pad</h1>
     <p>This page only works inside the app window. Run <code>npm run tauri dev</code> and use the window it opens.</p>
   </div>
@@ -241,7 +303,7 @@
   <div class="empty"></div>
 {:else if !vault}
   <div class="welcome">
-    <StickyNote size={48} strokeWidth={1.5} />
+    <img class="mark" src={blankIcon} alt="" width="96" height="96" />
     <h1>Vault Pad</h1>
     <p>Pick a folder. Every note becomes a <code>.md</code> file inside it, so an Obsidian vault works too.</p>
     <button class="primary" onclick={pickVault}><FolderOpen size={16} /> Choose folder…</button>
@@ -268,6 +330,8 @@
           <li>
             <button class:active={current?.path === note.path} onclick={() => openNote(note)}>
               <span class="row">
+                {#if isPinned(note)}<Pin size={12} class="badge" />{/if}
+                {#if isOut(note)}<StickyNote size={12} class="badge" />{/if}
                 <span class="title">{note.title}</span>
                 <span class="when">{ago(note.modified)}</span>
               </span>
@@ -284,6 +348,17 @@
       {#if current}
         <div class="toolbar">
           <span class="path" title={current.path}>{current.path}</span>
+          <button
+            class="icon"
+            class:on={isPinned(current)}
+            title={isPinned(current) ? 'Unpin from top of list' : 'Pin to top of list'}
+            onclick={() => togglePin(current)}
+          >
+            <Pin size={16} />
+          </button>
+          <button class="icon" title="Pop out as sticky note" onclick={() => popOut(current)}>
+            <SquareArrowOutUpRight size={16} />
+          </button>
           <button class="icon" title="Open notes folder" onclick={() => api.openVaultFolder().catch(report)}>
             <FolderOpen size={16} />
           </button>
@@ -294,7 +369,7 @@
         <Editor doc={current.body} loadKey={loadSeq} onchange={onEdit} />
       {:else}
         <div class="placeholder">
-          <StickyNote size={40} strokeWidth={1.25} />
+          <img class="mark" src={blankIcon} alt="" width="72" height="72" />
           <p>Select a note or press <kbd>Ctrl/Cmd</kbd>+<kbd>N</kbd></p>
         </div>
       {/if}
@@ -378,6 +453,15 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .row :global(.badge) {
+    flex-shrink: 0;
+    align-self: center;
+    color: var(--muted);
+  }
+  .toolbar button.on {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
   .when {
     font-size: 11px;
     color: var(--muted);
@@ -430,6 +514,11 @@
     color: var(--muted);
     text-align: center;
     padding: 24px;
+  }
+  .mark {
+    margin-bottom: 12px;
+    user-select: none;
+    -webkit-user-drag: none;
   }
   .welcome {
     height: 100vh;
