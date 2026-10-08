@@ -18,7 +18,7 @@
   let ready = $state(false);
   let notes = $state([]);
   let query = $state('');
-  let current = $state(null); // note open in the editor: { path, id, title, body, modified }
+  let current = $state(null); // note open in the editor: { path, id, title, body, modified, base }
   let loadSeq = $state(0); // bump to make the editor replace its document
   let error = $state('');
   let searchEl = $state();
@@ -88,17 +88,23 @@
     }
   }
 
-  // Picks up edits made in Obsidian (or anywhere) when the window regains focus.
+  // Picks up edits made in Obsidian (or anywhere): runs on focus and whenever
+  // the file watcher reports a change. With unsaved edits the editor is left
+  // alone; the next save turns a clash into a conflict copy.
   async function syncFromDisk() {
     await chain;
     await refresh();
     if (!current || dirty) return;
-    const fresh = notes.find((n) => n.path === current.path);
+    // Follow the note by id if it was renamed or moved elsewhere.
+    const fresh =
+      notes.find((n) => n.path === current.path) ?? (current.id && notes.find((n) => n.id === current.id));
     if (!fresh) {
       current = null;
     } else if (fresh.body !== current.body) {
-      current = { ...fresh };
+      current = { ...fresh, base: fresh.body };
       loadSeq++;
+    } else if (fresh.path !== current.path) {
+      current.path = fresh.path;
     }
   }
 
@@ -110,7 +116,8 @@
     const body = note.body;
     chain = chain
       .then(async () => {
-        const meta = await api.saveNote(note.path, body);
+        const meta = await api.saveNote(note.path, body, note.base);
+        note.base = body;
         moveToTop(note.path, meta);
         note.id = meta.id;
         note.modified = meta.modified;
@@ -150,7 +157,8 @@
     if (isOut(meta)) return popOut(meta); // already a sticky: bring it forward
     await leave();
     try {
-      current = await api.readNote(meta.path);
+      const fresh = await api.readNote(meta.path);
+      current = { ...fresh, base: fresh.body };
       loadSeq++;
     } catch (e) {
       report(e);
@@ -163,7 +171,7 @@
     try {
       const meta = await api.createNote();
       notes.unshift(meta);
-      current = { ...meta };
+      current = { ...meta, base: meta.body };
       query = '';
       loadSeq++;
     } catch (e) {
@@ -314,6 +322,11 @@
       }),
       listen('note-states-changed', refreshStates),
       listen('note-renamed', ({ payload }) => applyRename(payload.from, payload.note)),
+      listen('vault-changed', syncFromDisk),
+      listen('note-conflict', ({ payload }) => {
+        report(`${payload.path} was also changed outside Vault Pad. That version was kept as ${payload.copy}.`);
+        refresh();
+      }),
       // Edits made in sticky windows: keep the list's title/preview/order current.
       listen('note-changed', ({ payload }) => {
         if (payload.source === 'main') return;

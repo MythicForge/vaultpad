@@ -36,6 +36,7 @@ src/app.css             Global styles + color tokens (light/dark via prefers-col
 src-tauri/src/lib.rs    Tauri commands, AppState (vault path), config.json in OS config dir, sticky windows
 src-tauri/src/notes.rs  File format, naming, list/read/create/save/finalize/delete + tests
 src-tauri/src/sticky.rs <vault>/.sticky/state.json: per-note pinned/open/onTop/color/geometry + tests
+src-tauri/src/watch.rs  Vault file watcher (notify) + own-write suppression (`mark`)
 src-tauri/capabilities/default.json   Frontend permissions
 app-icon.svg            App icon source (yellow note with #)
 src-tauri/icons/vaultpad-blank.svg   Grey stand-in: in-app empty/welcome placeholders, future tray icon
@@ -68,6 +69,12 @@ body text
   the save `chain`. `rename_note` emits `note-renamed {from, note}`.
 - **Auto-delete only blank auto-named notes whose frontmatter holds nothing but `id`.**
 - **Writes are atomic** (`.<name>.tmp` + rename). Temp files are dotfiles so listing skips them.
+- **Every app-side create/write/rename/remove of a note calls `watch::mark(path)` first**
+  (`atomic_write` does it for writes). Unmarked writes make every window reload on each autosave.
+- **Saves never silently clobber outside edits.** Windows pass `base` (body they last loaded/saved) to
+  `save_note`; if disk differs from both `base` and the new body, `save_checked` first writes the disk
+  version to `<name> (conflict YYYY-MM-DD HHMM).md` (id line stripped so ids stay unique), then saves.
+  Keep `base` updated: set on load/reload, set to the saved body inside the chain after each save.
 - **Listing skips dot-directories** (`.obsidian`, `.trash`, `.sticky`).
 - **User delete → OS trash** (`trash` crate), never a hard delete.
 - **UI state lives in `.sticky/state.json` keyed by note `id`, never in frontmatter.** Entries equal to
@@ -81,7 +88,8 @@ body text
 - Typing → `onEdit` → 500 ms debounce → `flush()`. Saves are serialized through the `chain` promise;
   read `note.path` inside the chained callback, not before.
 - Leaving a note (switch, new, close, change vault) → `leave()` = flush + `finalize_note`.
-- Window blur → flush; focus → `syncFromDisk()` (reloads list; reloads editor if file changed and not dirty).
+- Window blur → flush; focus or `vault-changed` (watcher) → `syncFromDisk()` (reloads list; reloads editor
+  if file changed and not dirty; follows the open note by id if renamed elsewhere).
 - Main window close → `leave()` then **hide** (to tray); never quits. Quit = tray menu or Ctrl/Cmd+Q →
   `request_quit` emits `app-quitting`; every window saves and calls `quit_ready`; exit when all have
   answered (2 s fallback). Any new window type must join this handshake.
@@ -108,6 +116,14 @@ body text
   `innerPosition`; builder `inner_size` comes out ~37px too tall → size via `set_size` after build.
   Breaking either makes stickies creep a little on every restart.
 ## Tray / app lifecycle
+
+- Main window is `visible: false` in tauri.conf.json; setup shows it unless launched with `--hidden`
+  (what the login item passes) — a login start shows only the tray + restored stickies.
+- Global hotkey (`tauri-plugin-global-shortcut`, Rust-side only): default `CommandOrControl+Alt+N` →
+  new sticky; override with `"hotkey"` in config.json (no UI). Registration failure is logged, not fatal.
+  Doesn't work under Wayland. `set_vault` must keep other config fields (read-modify-write).
+- Start at login: `tauri-plugin-autostart`, tray CheckMenuItem. Uses the AppImage path when run as an
+  AppImage; enabling it from `tauri dev` points the login item at the debug binary.
 
 - Tray (`build_tray` in lib.rs, icon `src-tauri/icons/tray.png` = `vaultpad-blank.svg` at 64px):
   Show Vault Pad / New sticky note / Quit. Left click shows main on Windows/macOS; Linux only opens the menu.
@@ -139,8 +155,8 @@ body text
 
 1. ~~MVP: vault picker, list, editor, autosave, search, delete~~ (done)
 2. ~~Sticky windows (pop-out, color, always-on-top, + new sticky) and pin-to-top-of-list~~ (done)
-3. ~~Tray icon~~ (done); still to do: global hotkey for new note, autostart.
-4. File watcher (`notify` crate) with self-write suppression + conflict copies.
+3. ~~Tray icon, global hotkey for new note, autostart~~ (done)
+4. ~~File watcher (`notify` crate) with self-write suppression + conflict copies~~ (done)
 5. CI builds (tauri-action) for all three OSes.
 
 User preferences: per-sticky always-on-top toggle wanted (default off); plain Markdown editor with syntax highlighting (no live

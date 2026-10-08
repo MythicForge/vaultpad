@@ -1,5 +1,6 @@
 mod notes;
 mod sticky;
+mod watch;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -10,15 +11,30 @@ use std::time::Duration;
 use notes::NoteMeta;
 use serde::{Deserialize, Serialize};
 use sticky::NoteState;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
-/// Persisted in the OS config dir (e.g. ~/.config/dev.stickyvault.app/config.json).
+/// System-wide shortcut for a new sticky note, unless config.json sets `hotkey`.
+const DEFAULT_HOTKEY: &str = "CommandOrControl+Alt+N";
+/// Passed by the login item so the app starts with just the tray and stickies.
+const HIDDEN_ARG: &str = "--hidden";
+
+/// Persisted in the OS config dir (e.g. ~/.config/dev.vaultpad.app/config.json).
 #[derive(Default, Serialize, Deserialize)]
 struct Config {
     vault: Option<PathBuf>,
+    /// Global shortcut for a new sticky, in Tauri accelerator syntax
+    /// (e.g. "CommandOrControl+Alt+N"). Hand-edited; there's no UI for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hotkey: Option<String>,
+}
+
+fn read_config(path: &PathBuf) -> Config {
+    fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 struct AppState {
@@ -28,11 +44,20 @@ struct AppState {
     ui_lock: Mutex<()>,
     /// While quitting: labels of windows that haven't confirmed their final save.
     quitting: Mutex<Option<HashSet<String>>>,
+    /// Watches the current vault; replacing it stops the old watcher.
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 impl AppState {
     fn vault(&self) -> Result<PathBuf, String> {
         self.vault.lock().unwrap().clone().ok_or_else(|| "No notes folder selected".into())
+    }
+
+    fn watch(&self, app: &AppHandle, vault: &PathBuf) {
+        let watcher = watch::start(app.clone(), vault.clone())
+            .map_err(|e| eprintln!("file watcher unavailable for {}: {e}", vault.display()))
+            .ok();
+        *self.watcher.lock().unwrap() = watcher;
     }
 
     /// Updates one note's UI state and tells every window about it.
@@ -127,18 +152,55 @@ fn pop_out_path(app: &AppHandle, state: &AppState, path: &str) -> Result<NoteMet
     Ok(note)
 }
 
-/// Tray "New sticky note": a fresh note straight into its own window.
-fn new_sticky(app: &AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let note = notes::create(&state.vault()?)?;
-    pop_out_path(app, &state, &note.path).map(|_| ())
+/// Tray / global hotkey "New sticky note": a fresh note straight into its own
+/// window. Runs off the event loop (window creation there can deadlock on
+/// Windows); with no vault chosen yet it shows the main window instead.
+fn spawn_new_sticky(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let created = state
+            .vault()
+            .and_then(|vault| notes::create(&vault))
+            .and_then(|note| pop_out_path(&app, &state, &note.path));
+        if created.is_err() {
+            show_main(&app);
+        }
+    });
 }
 
-fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+/// "CommandOrControl+Alt+N" → "Ctrl+Alt+N" (or "Cmd+…" on macOS) for menus.
+fn pretty_hotkey(hotkey: &str) -> String {
+    let primary = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    hotkey.replace("CommandOrControl", primary).replace("CmdOrCtrl", primary)
+}
+
+fn register_hotkey(app: &tauri::App, hotkey: &str) -> tauri::Result<()> {
+    app.handle().plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(|app, _shortcut, event| {
+                if event.state() == ShortcutState::Pressed {
+                    spawn_new_sticky(app);
+                }
+            })
+            .build(),
+    )?;
+    // Not fatal: the combination may be taken by another app or the desktop.
+    if let Err(e) = app.global_shortcut().register(hotkey) {
+        eprintln!("couldn't register global shortcut {hotkey}: {e}");
+    }
+    Ok(())
+}
+
+fn build_tray(app: &tauri::App, hotkey: &str) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show Vault Pad", true, None::<&str>)?;
-    let new = MenuItem::with_id(app, "new-sticky", "New sticky note", true, None::<&str>)?;
+    let new_label = format!("New sticky note ({})", pretty_hotkey(hotkey));
+    let new = MenuItem::with_id(app, "new-sticky", new_label, true, None::<&str>)?;
+    let at_login = app.autolaunch().is_enabled().unwrap_or(false);
+    let autostart = CheckMenuItem::with_id(app, "autostart", "Start at login", true, at_login, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &new, &PredefinedMenuItem::separator(app)?, &quit])?;
+    let sep = || PredefinedMenuItem::separator(app);
+    let menu = Menu::with_items(app, &[&show, &new, &sep()?, &autostart, &sep()?, &quit])?;
     TrayIconBuilder::with_id("main")
         .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
         .tooltip("Vault Pad")
@@ -146,17 +208,19 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         // Left click shows the main window on Windows/macOS; Linux trays
         // only ever open the menu.
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
+        .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => show_main(app),
             "quit" => request_quit(app),
-            "new-sticky" => {
-                // Off the event loop: window creation there can deadlock on Windows.
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    if new_sticky(&app).is_err() {
-                        show_main(&app); // e.g. no vault chosen yet
-                    }
-                });
+            "new-sticky" => spawn_new_sticky(app),
+            "autostart" => {
+                let launcher = app.autolaunch();
+                let enable = !launcher.is_enabled().unwrap_or(false);
+                let result = if enable { launcher.enable() } else { launcher.disable() };
+                if let Err(e) = result {
+                    eprintln!("couldn't change start at login: {e}");
+                }
+                // Reflect what actually happened, whatever the click toggled.
+                let _ = autostart.set_checked(launcher.is_enabled().unwrap_or(false));
             }
             _ => {}
         })
@@ -194,13 +258,15 @@ fn set_vault(app: AppHandle, state: State<'_, AppState>, path: String) -> Result
             let _ = win.destroy();
         }
     }
-    let config = Config { vault: Some(path.clone()) };
+    let mut config = read_config(&state.config_path);
+    config.vault = Some(path.clone());
     if let Some(dir) = state.config_path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     fs::write(&state.config_path, json).map_err(|e| e.to_string())?;
     *state.vault.lock().unwrap() = Some(path.clone());
+    state.watch(&app, &path);
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -231,9 +297,26 @@ struct NoteChanged<'a> {
     source: &'a str,
 }
 
+#[derive(Clone, Serialize)]
+struct NoteConflict<'a> {
+    path: &'a str,
+    copy: &'a str,
+}
+
+/// `base`: the body this window last loaded or saved, for conflict detection
+/// (see notes::save_checked). A conflict is announced as `note-conflict`.
 #[tauri::command]
-fn save_note(window: tauri::Window, state: State<'_, AppState>, path: String, body: String) -> Result<NoteMeta, String> {
-    let note = notes::save(&state.vault()?, &path, &body)?;
+fn save_note(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    path: String,
+    body: String,
+    base: Option<String>,
+) -> Result<NoteMeta, String> {
+    let (note, conflict) = notes::save_checked(&state.vault()?, &path, &body, base.as_deref())?;
+    if let Some(copy) = &conflict {
+        let _ = window.emit("note-conflict", NoteConflict { path: &note.path, copy });
+    }
     let _ = window.emit("note-changed", NoteChanged { note: &note, source: window.label() });
     Ok(note)
 }
@@ -351,20 +434,29 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::Builder::new().app_name("Vault Pad").arg(HIDDEN_ARG).build())
         .setup(|app| {
             let config_path = app.path().app_config_dir()?.join("config.json");
-            let config: Config = fs::read_to_string(&config_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
+            let config = read_config(&config_path);
             let vault = config.vault.filter(|p| p.is_dir());
+            let hotkey = config.hotkey.unwrap_or_else(|| DEFAULT_HOTKEY.to_string());
             app.manage(AppState {
                 config_path,
-                vault: Mutex::new(vault),
+                vault: Mutex::new(vault.clone()),
                 ui_lock: Mutex::new(()),
                 quitting: Mutex::new(None),
+                watcher: Mutex::new(None),
             });
-            build_tray(app)?;
+            if let Some(vault) = &vault {
+                app.state::<AppState>().watch(app.handle(), vault);
+            }
+            register_hotkey(app, &hotkey)?;
+            build_tray(app, &hotkey)?;
+            // The main window starts hidden (tauri.conf.json) so a login
+            // start shows only the tray and stickies.
+            if !std::env::args().any(|a| a == HIDDEN_ARG) {
+                show_main(app.handle());
+            }
             Ok(())
         })
         // The main window only hides on close (App.svelte); quitting goes

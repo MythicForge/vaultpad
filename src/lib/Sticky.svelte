@@ -17,7 +17,7 @@
   const COLORS = ['yellow', 'pink', 'green', 'blue', 'purple', 'gray'];
   const win = getCurrentWindow();
 
-  let note = $state(null); // { path, id, title, body, modified }
+  let note = $state(null); // { path, id, title, body, modified, base }
   let missing = $state(false);
   let color = $state('yellow');
   let onTop = $state(false);
@@ -49,7 +49,8 @@
     const body = n.body;
     chain = chain
       .then(async () => {
-        const meta = await api.saveNote(n.path, body);
+        const meta = await api.saveNote(n.path, body, n.base);
+        n.base = body;
         n.id = meta.id;
         n.modified = meta.modified;
       })
@@ -78,7 +79,7 @@
       }
       missing = false;
       if (!note || fresh.body !== note.body) {
-        note = fresh;
+        note = { ...fresh, base: fresh.body };
         loadSeq++;
       } else {
         note.path = fresh.path;
@@ -168,6 +169,10 @@
     const unlisten = [
       win.onFocusChanged(({ payload: focused }) => (focused ? syncFromDisk() : flush())),
       // Quit keeps the sticky `open` so it comes back next launch.
+      listen('vault-changed', syncFromDisk),
+      listen('note-conflict', ({ payload }) => {
+        if (payload.path === note?.path) report(`Changed outside Vault Pad too; that version was kept as ${payload.copy}.`);
+      }),
       listen('app-quitting', async () => {
         await flush();
         await api.quitReady();

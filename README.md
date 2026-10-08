@@ -12,7 +12,8 @@ Quick-capture notes and desktop sticky notes that live as plain `.md` files in a
 - The list shows a note's name, or its first line while it still has a timestamp name.
 - Autosaves 500 ms after you stop typing (atomic temp file + rename).
 - Existing frontmatter / Obsidian properties are preserved; the app only adds a single `id:` line.
-- Edits made elsewhere (e.g. in Obsidian) are picked up when a window regains focus.
+- Edits made elsewhere (Obsidian, sync tools, other editors) show up immediately via a file watcher.
+- Nothing is silently overwritten: if a note changed on disk while you were editing it, the other version is kept as `<name> (conflict <time>).md` before your edit is saved.
 - Delete moves files to the OS trash.
 
 **Sticky notes**
@@ -27,7 +28,9 @@ Quick-capture notes and desktop sticky notes that live as plain `.md` files in a
 **Tray**
 
 - Closing the main window hides it to the tray; stickies stay on screen.
-- Tray menu: Show Vault Pad · New sticky note · Quit. Quitting saves every open window first.
+- Tray menu: Show Vault Pad · New sticky note · Start at login · Quit. Quitting saves every open window first.
+- Global hotkey `Ctrl+Alt+N` (`Cmd+Alt+N` on macOS) opens a new sticky note from anywhere. Change it with a `"hotkey"` entry in `config.json` in the app's config folder (e.g. `~/.config/dev.vaultpad.app/` on Linux), using [Tauri accelerator syntax](https://v2.tauri.app/reference/javascript/api/namespaceglobalshortcut/) such as `"CommandOrControl+Shift+Space"`.
+- When started at login, only the tray and your open stickies appear; the main window stays hidden.
 - Only one instance runs; launching it again brings the existing window back.
 
 ## Shortcuts
@@ -39,6 +42,7 @@ Quick-capture notes and desktop sticky notes that live as plain `.md` files in a
 | `Ctrl/Cmd+S` | Save now |
 | `F2` or `Ctrl/Cmd+Shift+R` | Rename (main window and stickies) |
 | `Ctrl/Cmd+Q` | Quit |
+| `Ctrl/Cmd+Alt+N` | New sticky note, system-wide (configurable) |
 
 ## Develop
 
@@ -66,7 +70,7 @@ The UI only works inside the app window; `localhost:1420` in a browser shows a n
 - Blank window: run with `WEBKIT_DISABLE_DMABUF_RENDERER=1` (WebKitGTK GPU issue).
 - The AppImage needs `libfuse2t64` on Ubuntu 24.04. If linuxdeploy fails while stripping, build with `NO_STRIP=true`.
 - The tray icon needs an AppIndicator-capable panel. Ubuntu's GNOME has one built in; stock GNOME needs the AppIndicator extension.
-- Keep on top works on X11. GNOME on Wayland doesn't let apps keep windows on top.
+- Keep on top and the global hotkey work on X11. GNOME on Wayland doesn't let apps keep windows on top or grab global shortcuts.
 
 ## Layout
 
@@ -79,6 +83,7 @@ src/lib/api.js             Wrappers for the Rust commands
 src-tauri/src/lib.rs       Tauri commands, config, sticky windows, tray, quit handling
 src-tauri/src/notes.rs     File format, naming, save/rename/delete (unit-tested)
 src-tauri/src/sticky.rs    .sticky/state.json storage (unit-tested)
+src-tauri/src/watch.rs     File watcher that ignores the app's own writes
 app-icon.svg               App icon source
 src-tauri/icons/vaultpad-blank.svg   Grey stand-in icon (placeholders, tray)
 ```
@@ -89,6 +94,6 @@ Regenerate app icons after editing `app-icon.svg`: rasterize to a 1024px PNG, ru
 
 1. ~~MVP: vault, list, editor, autosave, search~~
 2. ~~Sticky note windows, colors, keep on top, pin to top~~
-3. ~~Tray icon~~ · global hotkey for a new note · autostart
-4. File watcher + conflict copies
+3. ~~Tray icon, global hotkey for a new note, autostart~~
+4. ~~File watcher + conflict copies~~
 5. CI builds for Windows / macOS / Linux

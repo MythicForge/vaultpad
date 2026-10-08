@@ -12,6 +12,8 @@ use std::time::UNIX_EPOCH;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+use crate::watch::mark;
+
 const MAX_NAME_CHARS: usize = 60;
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H%M";
 
@@ -138,6 +140,7 @@ fn unique_path(dir: &Path, stem: &str) -> PathBuf {
 pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     let name = path.file_name().ok_or("invalid note path")?.to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.tmp"));
+    mark(path);
     fs::write(&tmp, contents).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -225,14 +228,53 @@ pub fn create(vault: &Path) -> Result<NoteMeta, String> {
 }
 
 pub fn save(vault: &Path, rel: &str, body: &str) -> Result<NoteMeta, String> {
+    save_checked(vault, rel, body, None).map(|(note, _)| note)
+}
+
+/// Saves `body`. `base` is the body the caller last loaded or saved; if the
+/// file on disk has since changed to something else, that version is first
+/// kept as a conflict copy, whose vault-relative path is returned alongside.
+pub fn save_checked(
+    vault: &Path,
+    rel: &str,
+    body: &str,
+    base: Option<&str>,
+) -> Result<(NoteMeta, Option<String>), String> {
     let abs = resolve(vault, rel)?;
     if let Some(dir) = abs.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    let existing = fs::read_to_string(&abs).unwrap_or_default();
-    let fm = with_id(split(&existing).frontmatter);
+    let existing = fs::read_to_string(&abs).ok();
+    let parsed = split(existing.as_deref().unwrap_or_default());
+    let conflict = match (base, &existing) {
+        (Some(base), Some(raw)) if parsed.body != base && parsed.body != body => {
+            Some(write_conflict_copy(vault, &abs, raw)?)
+        }
+        _ => None,
+    };
+    let fm = with_id(parsed.frontmatter);
     atomic_write(&abs, &format!("---\n{fm}---\n{body}"))?;
-    Ok(meta(vault, &abs, Parsed { frontmatter: Some(fm), body: body.to_string() }))
+    let note = meta(vault, &abs, Parsed { frontmatter: Some(fm), body: body.to_string() });
+    Ok((note, conflict))
+}
+
+/// Writes `raw` next to `abs` as `<name> (conflict <timestamp>).md`. The
+/// copy drops the `id` line so two files never share an id.
+fn write_conflict_copy(vault: &Path, abs: &Path, raw: &str) -> Result<String, String> {
+    let parsed = split(raw);
+    let fm: String = parsed
+        .frontmatter
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with("id:"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let contents = if fm.trim().is_empty() { parsed.body } else { format!("---\n{fm}---\n{}", parsed.body) };
+    let stamp = chrono::Local::now().format(TIMESTAMP_FORMAT);
+    let target = unique_path(abs.parent().unwrap_or(vault), &format!("{} (conflict {stamp})", stem(abs)));
+    atomic_write(&target, &contents)?;
+    Ok(rel_path(vault, &target))
 }
 
 /// Runs when the user leaves a note. A brand-new note (still carrying its
@@ -244,6 +286,7 @@ pub fn finalize(vault: &Path, rel: &str) -> Result<Option<NoteMeta>, String> {
     }
     let parsed = split(&fs::read_to_string(&abs).map_err(|e| format!("read {}: {e}", abs.display()))?);
     if is_auto_name(&stem(&abs)) && parsed.body.trim().is_empty() && only_has_id(parsed.frontmatter.as_deref()) {
+        mark(&abs);
         fs::remove_file(&abs).map_err(|e| format!("remove {}: {e}", abs.display()))?;
         return Ok(None);
     }
@@ -268,12 +311,15 @@ pub fn rename(vault: &Path, rel: &str, name: &str) -> Result<NoteMeta, String> {
     if target.exists() && !same_file {
         return Err(format!("A note named \"{wanted}\" already exists"));
     }
+    mark(&abs);
+    mark(&target);
     fs::rename(&abs, &target).map_err(|e| format!("rename {}: {e}", abs.display()))?;
     load(vault, &target)
 }
 
 pub fn delete(vault: &Path, rel: &str) -> Result<(), String> {
     let abs = resolve(vault, rel)?;
+    mark(&abs);
     trash::delete(&abs).map_err(|e| format!("move {} to trash: {e}", abs.display()))
 }
 
@@ -369,6 +415,32 @@ mod tests {
         assert!(!vault.join(&blank.path).exists());
 
         assert_eq!(list(vault).len(), 1);
+    }
+
+    #[test]
+    fn conflict_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = dir.path();
+        let note = save(v, "Plan.md", "mine v1\n").unwrap();
+
+        // No outside change: no copy.
+        let (_, c) = save_checked(v, "Plan.md", "mine v2\n", Some("mine v1\n")).unwrap();
+        assert!(c.is_none());
+
+        // Someone else rewrote the file (keeping a property) since we last saved.
+        let id = note.id.clone().unwrap();
+        fs::write(v.join("Plan.md"), format!("---\nid: {id}\ntags: [x]\n---\ntheirs\n")).unwrap();
+        let (saved, c) = save_checked(v, "Plan.md", "mine v3\n", Some("mine v2\n")).unwrap();
+        let copy = c.expect("conflict copy");
+        assert!(copy.starts_with("Plan (conflict ") && copy.ends_with(".md"));
+        assert_eq!(saved.body, "mine v3\n");
+        let raw = fs::read_to_string(v.join(&copy)).unwrap();
+        assert_eq!(raw, "---\ntags: [x]\n---\ntheirs\n");
+        assert_eq!(read(v, &copy).unwrap().id, None);
+
+        // Disk already equals what we're saving: not a conflict.
+        fs::write(v.join("Plan.md"), "same\n").unwrap();
+        assert!(save_checked(v, "Plan.md", "same\n", Some("old\n")).unwrap().1.is_none());
     }
 
     #[test]

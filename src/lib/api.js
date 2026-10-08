@@ -10,7 +10,9 @@ export const openVaultFolder = () => invoke('open_vault_folder');
 export const listNotes = () => invoke('list_notes');
 export const readNote = (path) => invoke('read_note', { path });
 export const createNote = () => invoke('create_note');
-export const saveNote = (path, body) => invoke('save_note', { path, body });
+// `base` is the body this window last loaded/saved; if the file changed on disk
+// since, the backend keeps that version as a conflict copy (`note-conflict` event).
+export const saveNote = (path, body, base) => invoke('save_note', { path, body, base });
 export const finalizeNote = (path) => invoke('finalize_note', { path });
 export const deleteNote = (path) => invoke('delete_note', { path });
 export const findNote = (id) => invoke('find_note', { id });
